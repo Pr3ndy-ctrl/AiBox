@@ -1,0 +1,47 @@
+# Example systemd template for long-running AI agents under aibox
+# Usage:
+#   systemctl start aibox@myagent
+#   systemctl enable aibox@myagent
+#
+# Create /etc/aibox/agents/myagent.conf or pass environment.
+
+[Unit]
+Description=aibox sandboxed AI agent (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aibox
+Group=aibox
+# WorkingDirectory can be set per instance via drop-in
+WorkingDirectory=/var/lib/aibox/workspaces/%i
+
+# Example — override with a drop-in or EnvironmentFile
+Environment=AIBOX_WORKSPACE=/var/lib/aibox/workspaces/%i
+ExecStart=/usr/local/bin/aibox run --workspace /var/lib/aibox/workspaces/%i --net none /usr/local/bin/agent-%i
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Hardening (extra layers on top of aibox)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# (AI workloads often need JIT / executable memory)
+
+# Resource limits example (tune per agent)
+# MemoryMax=8G
+# CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

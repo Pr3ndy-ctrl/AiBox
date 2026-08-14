@@ -1,0 +1,8 @@
+packaging/build/
+*.pyc
+__pycache__/
+*.log
+.env
+.DS_Store
+*.session
+/tmp/

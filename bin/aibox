@@ -1,0 +1,443 @@
+#!/usr/bin/env bash
+# aibox — Enterprise-ready AI Agent Sandbox for Linux
+# Version: 0.2.0
+# Copyright 2026 Pr3ndy-ctrl
+# Licensed under the Apache License, Version 2.0
+# https://github.com/Pr3ndy-ctrl/aibox
+
+set -euo pipefail
+
+VERSION="0.2.0"
+TOOL_NAME="aibox"
+BWRAP="$(command -v bwrap 2>/dev/null || true)"
+if [[ -z "$BWRAP" ]]; then
+  for c in /usr/bin/bwrap /bin/bwrap /usr/local/bin/bwrap; do
+    [[ -x "$c" ]] && BWRAP="$c" && break
+  done
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${AIBOX_LIB:-}"
+if [[ -z "$LIB_DIR" ]]; then
+  if [[ -f "${SCRIPT_DIR}/../lib/aibox-proxy.py" ]]; then
+    LIB_DIR="$(cd "${SCRIPT_DIR}/../lib" && pwd)"
+  elif [[ -f "/usr/share/aibox/aibox-proxy.py" ]]; then
+    LIB_DIR="/usr/share/aibox"
+  else
+    LIB_DIR="${SCRIPT_DIR}/../lib"
+  fi
+fi
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/aibox"
+LOG_DIR="${AIBOX_LOG_DIR:-/var/log/aibox}"
+CONFIG_SYSTEM="/etc/aibox/aibox.conf"
+CONFIG_USER="${XDG_CONFIG_HOME:-$HOME/.config}/aibox/aibox.conf"
+DEFAULT_WORKSPACE="$(pwd)"
+
+NETWORK_MODE="none"
+ALLOW_HOSTS=()
+ALLOW_GPU=false
+WORKSPACE=""
+EXTRA_RO_BINDS=()
+EXTRA_RW_BINDS=()
+KEEP_ENV=false
+VERBOSE=false
+DRY_RUN=false
+JSON_LOG=false
+SESSION_ID=""
+COMMAND=()
+LOG_TO_FILE=true
+USE_LANDLOCK=true
+PROXY_PID=""
+PROXY_PORT=""
+PROXY_LOG=""
+
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+  BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+else
+  RED=; GREEN=; YELLOW=; BLUE=; BOLD=; NC=
+fi
+
+log()  { [[ "$JSON_LOG" == true ]] && return; echo -e "${BLUE}[${TOOL_NAME}]${NC} $*" >&2; }
+info() { [[ "$JSON_LOG" == true ]] && return; echo -e "${GREEN}[${TOOL_NAME}]${NC} $*" >&2; }
+warn() { [[ "$JSON_LOG" == true ]] && return; echo -e "${YELLOW}[${TOOL_NAME}]${NC} $*" >&2; }
+err()  { echo -e "${RED}[${TOOL_NAME}]${NC} $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+json_event() {
+  local event="$1"; shift
+  local pairs=("event=${event}" "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "tool=${TOOL_NAME}" "version=${VERSION}")
+  [[ -n "${SESSION_ID:-}" ]] && pairs+=("sid=${SESSION_ID}")
+  local kv k v first=1 json="{"
+  for kv in "$@"; do
+    [[ -z "$kv" ]] && continue
+    pairs+=("$kv")
+  done
+  for kv in "${pairs[@]}"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    v="${v//\\/\\\\}"; v="${v//\"/\\\"}"
+    if [[ $first -eq 1 ]]; then first=0; else json+=","; fi
+    json+="\"${k}\":\"${v}\""
+  done
+  json+="}"
+  echo "$json" >&2
+  if [[ "$LOG_TO_FILE" == true ]]; then
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    echo "$json" >> "${LOG_DIR}/aibox.jsonl" 2>/dev/null || true
+  fi
+}
+
+usage() {
+  cat <<EOF
+${BOLD}aibox${NC} — Secure sandbox for AI agents (v${VERSION})
+
+USAGE
+  aibox [global] <command> [options] [args...]
+
+COMMANDS
+  run | shell | list | kill | info | version | help
+
+GLOBAL
+  -v, --verbose   --json   --dry-run   -c FILE   -h
+
+RUN / SHELL
+  -w, --workspace DIR
+  --net none|host|allow
+  --allow-net host1,host2   (implies --net allow)
+  --gpu   --ro PATH   --rw PATH   --keep-env
+  --no-landlock   --session-id ID
+
+NETWORK
+  none   full isolation
+  host   share host network
+  allow  cooperative HTTP(S) allow-list proxy (Python 3)
+
+EXAMPLES
+  aibox run python agent.py
+  aibox run --allow-net api.openai.com,api.anthropic.com python agent.py
+  aibox run --net host ollama run llama3
+  aibox run --gpu -w /data/jobs --json train.py
+
+License: Apache-2.0  |  https://github.com/Pr3ndy-ctrl/aibox
+EOF
+}
+
+load_config() {
+  local file="$1"; [[ -f "$file" ]] || return 0
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    [[ "$key" =~ ^[[:space:]]*# || -z "$key" ]] && continue
+    key=$(echo "$key" | xargs); value=$(echo "$value" | xargs)
+    value="${value%\"}"; value="${value#\"}"
+    case "$key" in
+      network_mode) NETWORK_MODE="$value" ;;
+      allow_gpu) ALLOW_GPU="$value" ;;
+      log_to_file) LOG_TO_FILE="$value" ;;
+      keep_env) KEEP_ENV="$value" ;;
+      use_landlock) USE_LANDLOCK="$value" ;;
+      allow_hosts) IFS=',' read -ra ALLOW_HOSTS <<< "$value" ;;
+    esac
+  done < "$file"
+}
+
+ensure_dirs() {
+  mkdir -p "$STATE_DIR"
+  if [[ "$LOG_TO_FILE" == true ]]; then
+    mkdir -p "$LOG_DIR" 2>/dev/null || {
+      LOG_DIR="${HOME}/.local/share/aibox/logs"; mkdir -p "$LOG_DIR"
+    }
+  fi
+}
+
+generate_session_id() {
+  [[ -n "$SESSION_ID" ]] && echo "$SESSION_ID" || echo "aibox-$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
+}
+
+record_session_start() {
+  local sid="$1" cmd_str="$2" pid="$3"
+  cat > "${STATE_DIR}/${sid}.session" <<EOF
+SESSION_ID=${sid}
+PID=${pid}
+START_TIME=$(date -Iseconds)
+WORKSPACE=${WORKSPACE}
+NETWORK_MODE=${NETWORK_MODE}
+ALLOW_GPU=${ALLOW_GPU}
+COMMAND=$(printf '%q' "$cmd_str")
+USER=$(id -un)
+HOST=$(hostname)
+EOF
+  json_event "session_start" "pid=${pid}" "net=${NETWORK_MODE}" "gpu=${ALLOW_GPU}" "cmd=${cmd_str}"
+}
+
+record_session_end() {
+  local sid="$1" exit_code="$2"
+  [[ -f "${STATE_DIR}/${sid}.session" ]] && {
+    echo "END_TIME=$(date -Iseconds)" >> "${STATE_DIR}/${sid}.session"
+    echo "EXIT_CODE=${exit_code}" >> "${STATE_DIR}/${sid}.session"
+  }
+  json_event "session_end" "exit=${exit_code}"
+}
+
+list_sessions() {
+  ensure_dirs
+  if [[ "$JSON_LOG" == true ]]; then
+    echo -n "["; local first=1
+    for f in "${STATE_DIR}"/*.session; do
+      [[ -f "$f" ]] || continue
+      # shellcheck disable=SC1090
+      source "$f" 2>/dev/null || continue
+      if kill -0 "$PID" 2>/dev/null; then
+        [[ $first -eq 1 ]] && first=0 || echo -n ","
+        printf '{"sid":"%s","pid":%s,"net":"%s"}' "$SESSION_ID" "$PID" "$NETWORK_MODE"
+      else rm -f "$f"; fi
+    done
+    echo "]"; return
+  fi
+  echo -e "${BOLD}Active aibox sessions:${NC}"
+  local found=0
+  for f in "${STATE_DIR}"/*.session; do
+    [[ -f "$f" ]] || continue
+    # shellcheck disable=SC1090
+    source "$f" 2>/dev/null || continue
+    if kill -0 "$PID" 2>/dev/null; then
+      found=1
+      printf "%-28s  pid=%-7s  net=%-5s\n" "$SESSION_ID" "$PID" "$NETWORK_MODE"
+    else rm -f "$f"; fi
+  done
+  [[ $found -eq 0 ]] && echo "  (none)"
+}
+
+kill_session() {
+  local target="$1" f="${STATE_DIR}/${target}.session"
+  [[ -f "$f" ]] || die "Session not found: $target"
+  # shellcheck disable=SC1090
+  source "$f"
+  if kill -0 "$PID" 2>/dev/null; then
+    kill -TERM "$PID" 2>/dev/null || true
+    sleep 0.3
+    kill -0 "$PID" 2>/dev/null && kill -KILL "$PID" 2>/dev/null || true
+    record_session_end "$target" 143
+    rm -f "$f"
+    info "Terminated $target"
+  else
+    rm -f "$f"; warn "Already dead"
+  fi
+}
+
+start_proxy() {
+  local hosts_csv; hosts_csv=$(IFS=,; echo "${ALLOW_HOSTS[*]}")
+  [[ -n "$hosts_csv" ]] || die "--net allow requires --allow-net HOSTS"
+  local proxy_script="${LIB_DIR}/aibox-proxy.py"
+  [[ -f "$proxy_script" ]] || die "Proxy not found: $proxy_script"
+  PROXY_LOG="${LOG_DIR}/proxy-${SESSION_ID:-$$}.jsonl"
+  mkdir -p "$(dirname "$PROXY_LOG")" 2>/dev/null || PROXY_LOG="/tmp/aibox-proxy-$$.jsonl"
+
+  local fifo; fifo=$(mktemp -u /tmp/aibox-fifo-XXXXXX)
+  mkfifo "$fifo"
+  python3 "$proxy_script" --port 0 --allow "$hosts_csv" --log "$PROXY_LOG" >"$fifo" 2>>"${PROXY_LOG}.err" &
+  PROXY_PID=$!
+  read -r PROXY_PORT <"$fifo" || true
+  rm -f "$fifo"
+  if [[ -z "${PROXY_PORT:-}" ]] || ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    die "Failed to start allow-list proxy"
+  fi
+  [[ "$VERBOSE" == true ]] && log "Proxy 127.0.0.1:${PROXY_PORT} pid=$PROXY_PID"
+  json_event "proxy_start" "port=${PROXY_PORT}" "pid=${PROXY_PID}" "hosts=${hosts_csv}"
+}
+
+stop_proxy() {
+  if [[ -n "${PROXY_PID:-}" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    kill -TERM "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+    json_event "proxy_stop" "pid=${PROXY_PID}"
+  fi
+  PROXY_PID=""
+}
+
+build_bwrap_args() {
+  local -n _out=$1
+  _out=()
+  _out+=(--die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts)
+  case "$NETWORK_MODE" in
+    none) _out+=(--unshare-net) ;;
+    host|allow) ;;
+    *) die "Invalid network mode: $NETWORK_MODE" ;;
+  esac
+
+  _out+=(--ro-bind /usr /usr --ro-bind /bin /bin)
+  [[ -d /sbin ]] && _out+=(--ro-bind /sbin /sbin)
+  _out+=(--ro-bind /lib /lib)
+  [[ -d /lib64 ]] && _out+=(--ro-bind /lib64 /lib64)
+  [[ -d /lib32 ]] && _out+=(--ro-bind /lib32 /lib32)
+  _out+=(--ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group)
+  _out+=(--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf)
+  [[ -f /etc/hosts ]] && _out+=(--ro-bind /etc/hosts /etc/hosts)
+  [[ -f /etc/resolv.conf ]] && _out+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
+  [[ -f /etc/ssl/certs/ca-certificates.crt ]] && _out+=(--ro-bind /etc/ssl/certs /etc/ssl/certs)
+  [[ -d /etc/alternatives ]] && _out+=(--ro-bind /etc/alternatives /etc/alternatives)
+
+  _out+=(--proc /proc --dev /dev --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run)
+  _out+=(--dir /var --dir /var/log --dir /var/cache)
+  _out+=(--tmpfs /home --dir /home/aibox)
+  _out+=(--setenv HOME /home/aibox --setenv USER aibox --setenv LOGNAME aibox)
+
+  [[ -z "$WORKSPACE" ]] && WORKSPACE="$DEFAULT_WORKSPACE"
+  WORKSPACE="$(realpath -m "$WORKSPACE")"
+  mkdir -p "$WORKSPACE"
+  _out+=(--bind "$WORKSPACE" "$WORKSPACE" --chdir "$WORKSPACE")
+
+  local p
+  for p in "${EXTRA_RO_BINDS[@]}"; do
+    [[ -e "$p" ]] || die "RO bind missing: $p"
+    _out+=(--ro-bind "$(realpath "$p")" "$(realpath "$p")")
+  done
+  for p in "${EXTRA_RW_BINDS[@]}"; do
+    [[ -e "$p" ]] || die "RW bind missing: $p"
+    _out+=(--bind "$(realpath "$p")" "$(realpath "$p")")
+  done
+
+  if [[ "$ALLOW_GPU" == true ]]; then
+    [[ -d /dev/dri ]] && _out+=(--dev-bind /dev/dri /dev/dri)
+    for dev in /dev/nvidia*; do [[ -e "$dev" ]] && _out+=(--dev-bind "$dev" "$dev"); done
+    [[ -d /dev/nvidia-caps ]] && _out+=(--dev-bind /dev/nvidia-caps /dev/nvidia-caps)
+  fi
+
+  if [[ "$KEEP_ENV" != true ]]; then
+    _out+=(--clearenv)
+    _out+=(--setenv PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    _out+=(--setenv HOME /home/aibox --setenv USER aibox --setenv LOGNAME aibox)
+    _out+=(--setenv TERM "${TERM:-xterm-256color}" --setenv LANG "${LANG:-C.UTF-8}" --setenv LC_ALL "${LC_ALL:-C.UTF-8}")
+    [[ -n "${OPENAI_API_KEY:-}" ]] && _out+=(--setenv OPENAI_API_KEY "$OPENAI_API_KEY")
+    [[ -n "${ANTHROPIC_API_KEY:-}" ]] && _out+=(--setenv ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY")
+    [[ -n "${HF_TOKEN:-}" ]] && _out+=(--setenv HF_TOKEN "$HF_TOKEN")
+    [[ -n "${HUGGING_FACE_HUB_TOKEN:-}" ]] && _out+=(--setenv HUGGING_FACE_HUB_TOKEN "$HUGGING_FACE_HUB_TOKEN")
+  fi
+
+  if [[ "$NETWORK_MODE" == "allow" && -n "${PROXY_PORT:-}" ]]; then
+    local proxy_url="http://127.0.0.1:${PROXY_PORT}"
+    _out+=(--setenv HTTP_PROXY "$proxy_url" --setenv HTTPS_PROXY "$proxy_url")
+    _out+=(--setenv http_proxy "$proxy_url" --setenv https_proxy "$proxy_url")
+    _out+=(--setenv ALL_PROXY "$proxy_url" --setenv all_proxy "$proxy_url")
+  fi
+  _out+=(--hostname aibox)
+}
+
+run_sandbox() {
+  if [[ -z "${BWRAP:-}" || ! -x "$BWRAP" ]]; then
+    die "bubblewrap (bwrap) not found. Install: apt install bubblewrap  OR  dnf install bubblewrap"
+  fi
+  ensure_dirs
+  local sid; sid=$(generate_session_id); SESSION_ID="$sid"
+
+  if [[ "$NETWORK_MODE" == "allow" ]]; then
+    start_proxy
+    trap 'stop_proxy' EXIT
+  fi
+
+  local -a bwrap_args
+  build_bwrap_args bwrap_args
+
+  local cmd_str; cmd_str=$(printf '%q ' "${COMMAND[@]}"); cmd_str=${cmd_str%% }
+
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "$BWRAP \\"
+    local a; for a in "${bwrap_args[@]}"; do printf '  %q \\\n' "$a"; done
+    printf '  %q\n' "${COMMAND[@]}"
+    stop_proxy; return 0
+  fi
+
+  info "Starting session ${sid}"
+  info "Workspace : $WORKSPACE"
+  info "Network   : $NETWORK_MODE"
+  [[ "$NETWORK_MODE" == "allow" ]] && info "Allow     : ${ALLOW_HOSTS[*]}"
+  info "GPU       : $ALLOW_GPU"
+
+  if [[ "${COMMAND[0]}" == "bash" || "${COMMAND[0]}" == "/bin/bash" || "${COMMAND[0]}" == "sh" ]] && \
+     [[ ${#COMMAND[@]} -eq 1 || ( ${#COMMAND[@]} -eq 2 && "${COMMAND[1]}" == "-l" ) ]]; then
+    record_session_start "$sid" "$cmd_str" "$$"
+    exec "$BWRAP" "${bwrap_args[@]}" -- "${COMMAND[@]}"
+  fi
+
+  "$BWRAP" "${bwrap_args[@]}" -- "${COMMAND[@]}" &
+  local bwrap_pid=$!
+  record_session_start "$sid" "$cmd_str" "$bwrap_pid"
+  local exit_code=0
+  wait "$bwrap_pid" || exit_code=$?
+  record_session_end "$sid" "$exit_code"
+  stop_proxy
+  [[ $exit_code -eq 0 ]] && info "Session $sid finished successfully" || warn "Session $sid exited with code $exit_code"
+  return $exit_code
+}
+
+show_info() {
+  [[ "$JSON_LOG" == true ]] && { json_event "info" "version=${VERSION}" "net=${NETWORK_MODE}"; return; }
+  echo -e "${BOLD}aibox security posture${NC}"
+  echo "Version          : $VERSION"
+  echo "bwrap            : ${BWRAP:-not found}"
+  echo "Network mode     : $NETWORK_MODE"
+  echo "GPU allowed      : $ALLOW_GPU"
+  echo "Landlock         : $USE_LANDLOCK (best-effort / future)"
+  echo "Workspace        : ${WORKSPACE:-$DEFAULT_WORKSPACE}"
+  echo "JSON logging     : $JSON_LOG"
+  echo "Log directory    : $LOG_DIR"
+  echo "Proxy helper     : ${LIB_DIR}/aibox-proxy.py"
+}
+
+parse_args() {
+  local subcommand="" remaining=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help|help) usage; exit 0 ;;
+      version|--version|-V) echo "$TOOL_NAME $VERSION"; exit 0 ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      --json) JSON_LOG=true; shift ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      -c|--config) load_config "$2"; shift 2 ;;
+      run|shell|list|kill|info) subcommand="$1"; shift; break ;;
+      -*) die "Unknown option: $1" ;;
+      *) subcommand="run"; remaining+=("$@"); break ;;
+    esac
+  done
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -w|--workspace) WORKSPACE="$2"; shift 2 ;;
+      --net)
+        case "$2" in none|host|allow) NETWORK_MODE="$2" ;; *) die "Invalid --net $2" ;; esac
+        shift 2 ;;
+      --allow-net)
+        NETWORK_MODE="allow"
+        IFS=',' read -ra ALLOW_HOSTS <<< "$2"
+        shift 2 ;;
+      --gpu) ALLOW_GPU=true; shift ;;
+      --ro) EXTRA_RO_BINDS+=("$2"); shift 2 ;;
+      --rw) EXTRA_RW_BINDS+=("$2"); shift 2 ;;
+      --keep-env) KEEP_ENV=true; shift ;;
+      --no-landlock) USE_LANDLOCK=false; shift ;;
+      --session-id) SESSION_ID="$2"; shift 2 ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      --json) JSON_LOG=true; shift ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      --) shift; remaining+=("$@"); break ;;
+      -*) remaining+=("$@"); break ;;
+      *) remaining+=("$1"); shift; remaining+=("$@"); break ;;
+    esac
+  done
+  case "$subcommand" in
+    run)
+      [[ ${#remaining[@]} -gt 0 ]] || die "No command. Example: aibox run python agent.py"
+      COMMAND=("${remaining[@]}"); run_sandbox ;;
+    shell) COMMAND=(bash); run_sandbox ;;
+    list) list_sessions ;;
+    kill) [[ ${#remaining[@]} -ge 1 ]] || die "aibox kill <id>"; kill_session "${remaining[0]}" ;;
+    info) show_info ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main() {
+  load_config "$CONFIG_SYSTEM"
+  load_config "$CONFIG_USER"
+  [[ -n "${AIBOX_CONFIG:-}" ]] && load_config "$AIBOX_CONFIG"
+  parse_args "$@"
+}
+main "$@"
