@@ -307,10 +307,6 @@ build_bwrap_args() {
     _out+=(--setenv PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     _out+=(--setenv HOME /home/aibox --setenv USER aibox --setenv LOGNAME aibox)
     _out+=(--setenv TERM "${TERM:-xterm-256color}" --setenv LANG "${LANG:-C.UTF-8}" --setenv LC_ALL "${LC_ALL:-C.UTF-8}")
-    [[ -n "${OPENAI_API_KEY:-}" ]] && _out+=(--setenv OPENAI_API_KEY "$OPENAI_API_KEY")
-    [[ -n "${ANTHROPIC_API_KEY:-}" ]] && _out+=(--setenv ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY")
-    [[ -n "${HF_TOKEN:-}" ]] && _out+=(--setenv HF_TOKEN "$HF_TOKEN")
-    [[ -n "${HUGGING_FACE_HUB_TOKEN:-}" ]] && _out+=(--setenv HUGGING_FACE_HUB_TOKEN "$HUGGING_FACE_HUB_TOKEN")
   fi
 
   if [[ "$NETWORK_MODE" == "allow" && -n "${PROXY_PORT:-}" ]]; then
